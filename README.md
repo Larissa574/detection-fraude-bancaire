@@ -1,2 +1,2 @@
-# d-tection-fraude-bancaire
+# détection-fraude-bancaire
 Détecter les fraudes bancaires dans une banque 
