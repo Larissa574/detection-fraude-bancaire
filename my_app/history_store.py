@@ -1,10 +1,15 @@
 import json
 from datetime import datetime
 from pathlib import Path
+import re
+import uuid
 from typing import Dict, List
 
+import streamlit as st
 
-_HISTORY_FILE = Path(__file__).resolve().parent / "analysis_history.json"
+_HISTORY_DIR = Path(__file__).resolve().parent / "analysis_history"
+_HISTORY_SCOPE_KEY = "history_scope"
+_HISTORY_SCOPE_QUERY_PARAM = "history_scope"
 
 
 def _normalize_legacy_entry(day_key: str, payload: Dict) -> Dict:
@@ -21,12 +26,67 @@ def _normalize_legacy_entry(day_key: str, payload: Dict) -> Dict:
     }
 
 
+def _sanitize_scope(raw_scope: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "", raw_scope).strip("_")
+    return cleaned[:64]
+
+
+def _get_history_scope() -> str:
+    query_scope = None
+
+    try:
+        query_scope = st.query_params.get(_HISTORY_SCOPE_QUERY_PARAM)
+    except Exception:
+        query_scope = None
+
+    if isinstance(query_scope, list):
+        query_scope = query_scope[0] if query_scope else None
+
+    if query_scope:
+        sanitized_query_scope = _sanitize_scope(str(query_scope))
+        if sanitized_query_scope:
+            try:
+                st.session_state[_HISTORY_SCOPE_KEY] = sanitized_query_scope
+            except Exception:
+                pass
+            return sanitized_query_scope
+
+    session_scope = None
+    try:
+        session_scope = st.session_state.get(_HISTORY_SCOPE_KEY)
+    except Exception:
+        session_scope = None
+
+    if not session_scope:
+        session_scope = uuid.uuid4().hex
+        try:
+            st.session_state[_HISTORY_SCOPE_KEY] = session_scope
+        except Exception:
+            pass
+
+    sanitized_session_scope = _sanitize_scope(str(session_scope)) or uuid.uuid4().hex
+
+    try:
+        st.query_params[_HISTORY_SCOPE_QUERY_PARAM] = sanitized_session_scope
+    except Exception:
+        pass
+
+    return sanitized_session_scope
+
+
+def _history_file() -> Path:
+    scope = _get_history_scope()
+    _HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    return _HISTORY_DIR / f"history_{scope}.json"
+
+
 def load_history() -> List[Dict]:
-    if not _HISTORY_FILE.exists():
+    history_file = _history_file()
+    if not history_file.exists():
         return []
 
     try:
-        raw = json.loads(_HISTORY_FILE.read_text(encoding="utf-8"))
+        raw = json.loads(history_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return []
 
@@ -41,7 +101,8 @@ def load_history() -> List[Dict]:
 
 
 def save_history(entries: List[Dict]) -> None:
-    _HISTORY_FILE.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+    history_file = _history_file()
+    history_file.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def append_history_entry(entry: Dict, keep_last: int = 1000) -> None:
