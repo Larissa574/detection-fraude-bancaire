@@ -1,73 +1,90 @@
+import json
 from pathlib import Path
 
 import joblib
-import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.metrics import auc, confusion_matrix, f1_score, precision_score, recall_score, roc_curve
 
 
 st.title("Performance du modèle")
 st.caption("Évaluation du modèle sur le jeu de données labellisé avec seuil de décision ajustable en temps réel.")
 
 
+MODEL_CACHE_VERSION = "2026-04-02-sklearn-only"
+
+
 @st.cache_resource
-def load_model_artifact():
-	model_path = Path(__file__).resolve().parent.parent.parent / "models" / "model.joblib"
-	if not model_path.exists():
-		st.error("Fichier modèle introuvable: `models/model.joblib`.")
-		st.stop()
-	return joblib.load(model_path)
+def load_model_artifact(cache_version: str = MODEL_CACHE_VERSION):
+	_ = cache_version
+	models_dir = Path(__file__).resolve().parent.parent.parent / "models"
+	candidates = ["model_sklearn.joblib", "model.joblib"]
+	load_errors = []
+
+	for filename in candidates:
+		model_path = models_dir / filename
+		if not model_path.exists():
+			continue
+		try:
+			return joblib.load(model_path)
+		except ModuleNotFoundError as error:
+			load_errors.append(f"{filename}: {error}")
+		except Exception as error:
+			load_errors.append(f"{filename}: {type(error).__name__}: {error}")
+
+	if load_errors:
+		raise RuntimeError(" ; ".join(load_errors))
+
+	raise FileNotFoundError(
+		"Aucun modèle exploitable trouvé dans models/. Fichiers attendus: model_sklearn.joblib ou model.joblib"
+	)
 
 
 @st.cache_data(show_spinner=True)
 def load_evaluation_scores():
 	artifact = load_model_artifact()
-	csv_path = Path(__file__).resolve().parent.parent.parent / "creditcard.csv"
+	summary_path = Path(__file__).resolve().parent.parent.parent / "models" / "performance_summary.json"
 
-	if not csv_path.exists():
-		raise FileNotFoundError("Fichier `creditcard.csv` introuvable.")
+	if summary_path.exists():
+		summary = json.loads(summary_path.read_text(encoding="utf-8"))
+		threshold_metrics = summary.get("threshold_metrics", [])
+		roc_points = summary.get("roc_points", [])
+		if not threshold_metrics or not roc_points:
+			raise ValueError("Le fichier `models/performance_summary.json` est incomplet.")
+		return {
+			"threshold_metrics": threshold_metrics,
+			"roc_points": roc_points,
+			"roc_auc": float(summary.get("roc_auc", 0.0)),
+			"default_threshold": float(summary.get("default_threshold", artifact["threshold"])),
+			"total_rows": int(summary.get("total_rows", 0)),
+			"positive_rows": int(summary.get("positive_rows", 0)),
+			"negative_rows": int(summary.get("negative_rows", 0)),
+		}
 
-	df = pd.read_csv(csv_path)
+	raise FileNotFoundError("Fichier `models/performance_summary.json` introuvable.")
 
-	features = artifact["features"]
-	missing_columns = [column for column in features + ["Class"] if column not in df.columns]
-	if missing_columns:
-		raise ValueError(f"Colonnes manquantes dans `creditcard.csv`: {', '.join(missing_columns)}")
 
-	X = df[features]
-	y_true = pd.to_numeric(df["Class"], errors="coerce").fillna(0).astype(int)
+def compute_threshold_metrics(summary, threshold):
+	selected_threshold = round(float(threshold), 2)
+	metric_entry = next(
+		(entry for entry in summary["threshold_metrics"] if round(float(entry["threshold"]), 2) == selected_threshold),
+		None,
+	)
+	if metric_entry is None:
+		metric_entry = min(
+			summary["threshold_metrics"],
+			key=lambda entry: abs(float(entry["threshold"]) - selected_threshold),
+		)
 
-	X_processed = artifact["preprocessor"].transform(X)
-	y_score = artifact["model"].predict_proba(X_processed)[:, 1]
-
-	fpr, tpr, roc_thresholds = roc_curve(y_true, y_score)
-	roc_auc = auc(fpr, tpr)
-
+	matrix = [[int(metric_entry["tn"]), int(metric_entry["fp"])], [int(metric_entry["fn"]), int(metric_entry["tp"])] ]
+	precision = float(metric_entry["precision"])
+	recall = float(metric_entry["recall"])
+	f1 = float(metric_entry["f1"])
 	return {
-		"y_true": y_true,
-		"y_score": y_score,
-		"fpr": fpr,
-		"tpr": tpr,
-		"roc_thresholds": roc_thresholds,
-		"roc_auc": roc_auc,
-		"default_threshold": float(artifact["threshold"]),
-		"total_rows": int(len(df)),
-	}
-
-
-def compute_threshold_metrics(y_true, y_score, threshold):
-	y_pred = (y_score >= threshold).astype(int)
-	matrix = confusion_matrix(y_true, y_pred, labels=[0, 1])
-	precision = precision_score(y_true, y_pred, zero_division=0)
-	recall = recall_score(y_true, y_pred, zero_division=0)
-	f1 = f1_score(y_true, y_pred, zero_division=0)
-	return {
-		"y_pred": y_pred,
 		"matrix": matrix,
 		"precision": precision,
 		"recall": recall,
 		"f1": f1,
+		"threshold": selected_threshold,
 	}
 
 
@@ -97,11 +114,11 @@ def build_confusion_matrix_figure(matrix):
 	return figure
 
 
-def build_roc_figure(fpr, tpr, roc_auc, roc_thresholds, selected_threshold):
-	operating_index = min(
-		range(len(roc_thresholds)),
-		key=lambda index: abs(float(roc_thresholds[index]) - selected_threshold),
-	)
+def build_roc_figure(roc_points, roc_auc, selected_threshold):
+	fpr = [float(point["fpr"]) for point in roc_points]
+	tpr = [float(point["tpr"]) for point in roc_points]
+	thresholds = [float(point["threshold"]) for point in roc_points]
+	operating_index = min(range(len(thresholds)), key=lambda index: abs(thresholds[index] - selected_threshold))
 
 	figure = go.Figure()
 	figure.add_trace(
@@ -162,8 +179,9 @@ selected_threshold = st.slider(
 	help="Une transaction est classée comme fraude si sa probabilité est supérieure ou égale à ce seuil.",
 )
 
-metrics = compute_threshold_metrics(evaluation["y_true"], evaluation["y_score"], selected_threshold)
-tn, fp, fn, tp = metrics["matrix"].ravel()
+metrics = compute_threshold_metrics(evaluation, selected_threshold)
+tn, fp = metrics["matrix"][0]
+fn, tp = metrics["matrix"][1]
 
 top1, top2, top3, top4 = st.columns(4)
 top1.metric("Precision", f"{metrics['precision']:.3f}")
@@ -187,12 +205,6 @@ with left_col:
 with right_col:
 	st.subheader("Courbe ROC")
 	st.plotly_chart(
-		build_roc_figure(
-			evaluation["fpr"],
-			evaluation["tpr"],
-			evaluation["roc_auc"],
-			evaluation["roc_thresholds"],
-			selected_threshold,
-		),
+		build_roc_figure(evaluation["roc_points"], evaluation["roc_auc"], selected_threshold),
 		use_container_width=True,
 	)

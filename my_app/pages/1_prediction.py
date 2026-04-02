@@ -24,21 +24,35 @@ Cette application propose 2 modes:
 st.warning("Ce modèle est un outil d'aide et ne remplace pas la vérification humaine.")
 
 
+MODEL_CACHE_VERSION = "2026-04-02-sklearn-only"
+
+
 @st.cache_resource
-def load_model():
+def load_model(cache_version: str = MODEL_CACHE_VERSION):
+    _ = cache_version
     base_dir = Path(__file__).resolve().parent.parent.parent
     models_dir = base_dir / "models"
 
-    preferred_model = models_dir / "model.joblib"
-    if preferred_model.exists():
-        return joblib.load(preferred_model)
+    candidates = ["model_sklearn.joblib", "model.joblib"]
+    load_errors = []
 
-    model_files = list(models_dir.glob("*.joblib"))
-    if not model_files:
-        raise FileNotFoundError("Aucun modèle trouvé dans le dossier models.")
+    for filename in candidates:
+        model_path = models_dir / filename
+        if not model_path.exists():
+            continue
+        try:
+            return joblib.load(model_path)
+        except ModuleNotFoundError as error:
+            load_errors.append(f"{filename}: {error}")
+        except Exception as error:
+            load_errors.append(f"{filename}: {type(error).__name__}: {error}")
 
-    latest_model = max(model_files, key=lambda x: x.stat().st_mtime)
-    return joblib.load(latest_model)
+    if load_errors:
+        raise RuntimeError(" ; ".join(load_errors))
+
+    raise FileNotFoundError(
+        "Aucun modèle exploitable trouvé dans models/. Fichiers attendus: model_sklearn.joblib ou model.joblib"
+    )
 
 
 def analyze_dataframe(df, model, preprocessor, threshold, features):
